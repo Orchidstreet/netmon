@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- launchd agent for netmon on macOS. Replace /opt/netmon with the folder that holds netmon.py,
+     then: cp com.netmon.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.netmon.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.netmon</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/bin/python3</string><string>/opt/netmon/netmon.py</string><string>--config</string><string>/opt/netmon/config.json</string></array>
+  <key>WorkingDirectory</key><string>/opt/netmon</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/tmp/netmon-launchd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/netmon-launchd.log</string>
+</dict>
+</plist>

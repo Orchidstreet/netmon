@@ -1,0 +1,22 @@
+# The operator's own settings and secrets
+config.json
+gate.conf
+health.conf
+tokens
+tokens/
+scan.deny
+
+# Data the collector writes
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Build-coordination notes that name the original network; never published
+CONTRACT.md
+
+# Tooling
+__pycache__/
+*.pyc
+.DS_Store
+selftest/queue/

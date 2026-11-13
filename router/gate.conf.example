@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# /etc/netmon/gate.conf: settings for netmon-gate and the other netmon scripts on the router.
+# The file is read with the shell's "." command, so it is plain NAME="value" lines.
+# Install it owned by root with mode 600. Every value below is an example: change it to match the router.
+
+# Addresses the collector connects from (space-separated). The gate refuses every other source.
+# An empty value refuses everything, so this must be set.
+ALLOW_FROM="192.168.1.20"
+
+# Interfaces. WAN_IFACE faces the uplink; LAN_BRIDGES are the bridges of the local zones.
+WAN_IFACE="eth1"
+LAN_BRIDGES="br-lan br-iot"
+
+# Wired switch ports reported by "links" and watched by netmon-watchdog.sh.
+WIRED_PORTS="lan1 lan2 lan3 lan4 lan5"
+
+# Wi-Fi interfaces for iwinfo. Empty means: every interface iwinfo lists with an ESSID.
+WIFI_IFACES=""
+
+# Interfaces "capture" accepts. Empty means LAN_BRIDGES plus WAN_IFACE.
+CAPTURE_IFACES=""
+
+# SSH port to leave out of captures, so the capture never records its own control channel.
+SSH_PORT="22"
+
+# netifyd's JSON feed, read by "feed".
+FEED_HOST="127.0.0.1"
+FEED_PORT="7150"
+NETIFYD_PID="/var/run/netifyd/netifyd.pid"
+NETIFYD_APPS="/etc/netifyd/netify-apps.conf"
+
+# Router protection limits. The gate refuses or stops heavy work when the router is past any of them.
+LOAD_MAX="300"                                         # load average x 100
+TEMP_MAX="85000"                                       # millidegrees Celsius
+MEM_MIN="60000"                                        # kB of MemAvailable
+THERMAL="/sys/class/thermal/thermal_zone0/temp"
+
+# dnsmasq query log, read by "dnslog". dnsmasq needs: option logqueries '1' and option logfacility '<this path>'.
+DNS_LOG="/tmp/dnsmasq.log"
+
+# CAKE shaper devices read by "cake" and "integrity". Empty disables "cake".
+SHAPER_DEVS="eth1 ifb4eth1"
+
+# VPN switch. VPN_BACKEND is one of:
+#   none    no VPN switch; "vpn on" and "vpn off" are refused
+#   uci     a plain OpenWrt WireGuard interface named VPN_IFACE, switched with uci network.<iface>.disabled
+#   glinet  the GL.iNet firmware's VPN client (route_policy rule 0), switched through /etc/init.d/vpn-client
+VPN_BACKEND="none"
+VPN_IFACE="wg0"
+VPN_PEER_ID=""                                         # glinet only: the one peer id the switch may turn on
+VPN_UP_WAIT="30"                                       # seconds to wait for a handshake before switching back off
+
+# VPN-aware DNS redirect (netmon-vpn-dns.sh). While the VPN is on, LAN queries for VPN_DNS_FROM_PORT are
+# redirected to VPN_DNS_TO_PORT, a resolver that sends its queries through the tunnel. Empty disables it.
+VPN_DNS_FROM_PORT=""
+VPN_DNS_TO_PORT=""
+VPN_DNS_IFACES=""                                      # empty means LAN_BRIDGES
+VPN_DNS_SERVICE=""                                     # init script that starts the tunnel resolver, if any
+
+# Layer 2 block (firewall.netmon_l2block): MAC addresses dropped at the bridge.
+L2BLOCK_MACS=""
+L2BLOCK_WIFI_ACL_IFACES=""                             # MediaTek iwpriv interfaces that also get a Wi-Fi ACL entry
+
+# Traffic priority (firewall.netmon_prio): devices whose upload is marked with PRIO_DSCP.
+PRIO_MACS=""
+PRIO_DSCP="AF41"
+DSCPMARK_IFACES=""                                     # empty means WAN_IFACE, plus VPN_IFACE when a VPN backend is set
+
+# Link watchdog (netmon-watchdog.sh): ports it renegotiates when they lose carrier.
+WATCHDOG_PORTS=""
+WATCHDOG_DOWN_AFTER="60"                               # seconds without carrier before it acts
+WATCHDOG_MIN_GAP="300"                                 # seconds between two resets of the same port
+
+# Files whose SHA-256 "integrity" reports, and whether each is on the keep-on-upgrade list.
+INTEGRITY_FILES="/usr/bin/netmon-gate /etc/netmon/gate.conf /usr/bin/netmon-vpn-dns.sh /usr/bin/netmon-watchdog.sh /etc/netmon/firewall.netmon_vpn_dns /etc/netmon/firewall.netmon_prio /etc/netmon/firewall.netmon_l2block"

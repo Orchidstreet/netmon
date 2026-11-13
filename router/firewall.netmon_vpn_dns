@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Firewall include: brings the VPN-aware DNS redirect back in step with the VPN switch on every firewall
+# start and reload. Install as /etc/netmon/firewall.netmon_vpn_dns (see docs/INSTALL.md for the uci lines).
+[ -x /usr/bin/netmon-vpn-dns.sh ] && /usr/bin/netmon-vpn-dns.sh sync

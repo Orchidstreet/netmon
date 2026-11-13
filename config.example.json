@@ -1,0 +1,22 @@
+{
+  "site":      {"name": "Head office", "short": "HQ", "cc": "GB", "tz": "Europe/London"},
+  "router":    {"name": "edge-01", "model": "GL-MT6000", "ip": "192.168.1.1", "ssh": "root@192.168.1.1",
+                "key": "~/.ssh/id_ed25519_netmon", "gate": "/usr/bin/netmon-gate",
+                "wan_iface": "eth1", "lan_bridges": {"lan": "br-lan", "iot": "br-iot"},
+                "vitals_every_s": 10, "conns_every_s": 30,
+                "limits": {"load1": 2.5, "temp_c": 80, "mem_avail_kb": 80000}},
+  "uplink":    {"name": "ONT", "kind": "Fibre 1000/1000", "ip": "192.168.0.1"},
+  "isp":       {"name": "Example Fibre"},
+  "collector": {"name": "netmon-01", "data_dir": "/var/lib/netmon", "port": 7780, "bind": "::",
+                "allow": ["127.0.0.1", "::1", "192.168.1.0/24"], "hosts": []},
+  "zones":     [{"key": "lan", "name": "Office network", "cidr": "192.168.1.0/24"},
+                {"key": "iot", "name": "Cameras and IoT", "cidr": "192.168.20.0/24", "fenced": true}],
+  "dns":       {"source": "dnsmasq", "log": "/tmp/dnsmasq.log", "upstream_label": "Quad9", "filter_name": ""},
+  "latency_targets": {"edge-01": "192.168.1.1", "ONT": "192.168.0.1", "Quad9": "9.9.9.9", "Cloudflare": "1.1.1.1"},
+  "vpn":       {"enabled": false, "label": "VPN", "interface": "wg0", "profile": "", "provider_org": ""},
+  "alerts":    {"email_to": "", "smtp": {"host": "", "port": 587, "user": "", "from": ""}},
+  "actions":   {"vpn_switch": false, "load_test": false, "captures": true},
+  "heal":      {"vpn_off_when_tunnel_down": false},
+  "health_machines": [],
+  "retention_days": 90
+}

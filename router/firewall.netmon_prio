@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Firewall include: gives the devices in PRIO_MACS a higher CAKE tin in both directions.
+#  - Their outgoing packets are marked with DSCP class PRIO_DSCP (default AF41, CAKE's Video tin), so the
+#    upload shapers serve them first.
+#  - Every connection leaving through DSCPMARK_IFACES stores its DSCP in the conntrack mark (bits 0xfc000000,
+#    valid flag 0x01000000). A download shaper that restores DSCP with tc ctinfo (for example an SQM script
+#    based on piece_of_cake with a ctinfo filter) then puts the replies in the same tin.
+# Runs on every firewall start and reload. Idempotent. Settings come from /etc/netmon/gate.conf.
+# Needs iptables-mod-ipopt (DSCP) and iptables-mod-conntrack-extra (CONNMARK --set-dscpmark, an OpenWrt
+# extension). Check that the mark bits do not overlap marks the firmware already uses.
+CONF=${NETMON_GATE_CONF:-/etc/netmon/gate.conf}
+[ -r "$CONF" ] && . "$CONF"
+: "${WAN_IFACE:=eth1}" "${PRIO_DSCP:=AF41}" "${VPN_BACKEND:=none}" "${VPN_IFACE:=wg0}"
+if [ -z "$DSCPMARK_IFACES" ]; then
+  DSCPMARK_IFACES=$WAN_IFACE; [ "$VPN_BACKEND" != none ] && DSCPMARK_IFACES="$DSCPMARK_IFACES $VPN_IFACE"
+fi
+IPT="iptables -w -t mangle"
+$IPT -N netmon_prio 2>/dev/null; $IPT -F netmon_prio
+for m in $PRIO_MACS; do $IPT -A netmon_prio -m mac --mac-source "$m" -j DSCP --set-dscp-class "$PRIO_DSCP"; done
+$IPT -C FORWARD -j netmon_prio 2>/dev/null || $IPT -A FORWARD -j netmon_prio
+$IPT -N netmon_dscpmark 2>/dev/null; $IPT -F netmon_dscpmark
+[ -n "$PRIO_MACS" ] && for o in $DSCPMARK_IFACES; do $IPT -A netmon_dscpmark -o "$o" -j CONNMARK --set-dscpmark 0xfc000000/0x01000000; done
+$IPT -C POSTROUTING -j netmon_dscpmark 2>/dev/null || $IPT -A POSTROUTING -j netmon_dscpmark

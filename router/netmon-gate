@@ -1,0 +1,357 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# netmon-gate: the restricted command gate for the collector's SSH key on an OpenWrt router.
+# Install as /usr/bin/netmon-gate and name it as the key's forced command in /etc/dropbear/authorized_keys:
+#   command="/usr/bin/netmon-gate",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA...
+# The SSH server puts the requested command in SSH_ORIGINAL_COMMAND. The gate runs only the subcommands listed
+# below and answers {"gate":"not-allowed"} to anything else. Settings come from /etc/netmon/gate.conf.
+#
+# Subcommands:
+#   feed                 netifyd's JSON flow feed, streamed until the router gets too busy
+#   vitals               one JSON line: load, CPU, memory, temperature, conntrack, Wi-Fi clients, interface counters
+#   conns                the conntrack table (at most 4000 lines), at most once every 5 s
+#   leases               the DHCP lease file
+#   protos               netifyd's protocol list
+#   apps                 netifyd's application list
+#   links                Wi-Fi stations, ARP entries, wired ports and bridge forwarding entries, one per line
+#   capture IFACE SECS   a pcap of IFACE for 5 to 30 s, 256 bytes per packet
+#   ispview SECS         a pcap of the uplink side, connection openings and handshakes only, 5 to 30 s
+#   dnslog               dnsmasq's query log as one JSON line per lookup, followed from its end
+#   cake                 CAKE shaper counters
+#   health               machine health facts in the netmon-health line format
+#   integrity            file hashes and shaper settings, for the self-test to compare with a blessed copy
+#   vpn status|on|off    read or switch the VPN
+#
+# Exit codes:
+#   0  success
+#   1  refused: wrong source address, not configured, not allowed, or a bad argument
+#   3  the router is past a protection limit (load, temperature or memory); the JSON line carries the readings
+#   4  busy or rate-limited: another capture or VPN change holds the lock, or the last run was too recent
+#   5  "vpn on" saw no handshake in time and switched the VPN back off
+#   6  the data source for this subcommand is not available on this router
+# Every refusal prints one JSON line {"gate":"<reason>", ...} on stdout.
+#
+# The request may name the gate itself first ("/usr/bin/netmon-gate vitals" or "netmon-gate vitals"); that
+# word is dropped. Run by hand without a forced command, the gate reads its arguments instead.
+
+set -f                                                   # no filename expansion of anything the caller sends
+umask 077
+CONF=${NETMON_GATE_CONF:-/etc/netmon/gate.conf}
+[ -r "$CONF" ] || { echo '{"gate":"not-configured"}'; exit 1; }
+. "$CONF"
+
+: "${LOAD_MAX:=300}" "${TEMP_MAX:=85000}" "${MEM_MIN:=60000}" "${THERMAL:=/sys/class/thermal/thermal_zone0/temp}"
+: "${WAN_IFACE:=eth1}" "${LAN_BRIDGES:=br-lan}" "${SSH_PORT:=22}" "${FEED_HOST:=127.0.0.1}" "${FEED_PORT:=7150}"
+: "${NETIFYD_PID:=/var/run/netifyd/netifyd.pid}" "${NETIFYD_APPS:=/etc/netifyd/netify-apps.conf}"
+: "${DNS_LOG:=/tmp/dnsmasq.log}" "${VPN_BACKEND:=none}" "${VPN_IFACE:=wg0}" "${VPN_UP_WAIT:=30}"
+: "${CAPTURE_IFACES:=$LAN_BRIDGES $WAN_IFACE}"
+VPNDNS=/usr/bin/netmon-vpn-dns.sh
+
+refuse() { echo "{\"gate\":\"$1\"}"; exit "${2:-1}"; }
+
+REQ=${SSH_ORIGINAL_COMMAND:-$*}
+case "$REQ" in
+  netmon-gate|*/netmon-gate) REQ="" ;;
+  netmon-gate\ *|*/netmon-gate\ *) REQ=${REQ#* } ;;
+esac
+
+# The caller's address is the first word of SSH_CLIENT. Over SSH, only addresses in ALLOW_FROM are served.
+# A run from the router's own shell (no SSH variables at all) is not checked.
+if [ -n "$SSH_CLIENT$SSH_CONNECTION$SSH_ORIGINAL_COMMAND" ]; then
+  SRC=${SSH_CLIENT%% *}
+  [ -n "$ALLOW_FROM" ] || { logger -t netmon-gate "ALLOW_FROM is empty in $CONF; refusing"; refuse not-configured; }
+  ok=0; for a in $ALLOW_FROM; do [ "$SRC" = "$a" ] && ok=1; done
+  [ $ok = 1 ] || { logger -t netmon-gate "refused a request from ${SRC:-an unknown address}"; refuse wrong-source; }
+fi
+
+metrics() {
+  L=$(awk '{printf "%d", $1*100}' /proc/loadavg)
+  T=$(cat "$THERMAL" 2>/dev/null || echo 0)
+  M=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+  L=${L:-0}; T=${T:-0}; M=${M:-0}
+}
+healthy() { metrics; [ "$L" -le "$LOAD_MAX" ] && [ "$T" -le "$TEMP_MAX" ] && [ "$M" -ge "$MEM_MIN" ]; }
+busy() { echo "{\"gate\":\"$1\",\"load_x100\":$L,\"temp_mc\":$T,\"mem_avail_kb\":$M}"; exit 3; }
+counters() { printf '"%s":[%s,%s]' "$1" "$(cat /sys/class/net/$1/statistics/rx_bytes 2>/dev/null || echo 0)" \
+  "$(cat /sys/class/net/$1/statistics/tx_bytes 2>/dev/null || echo 0)"; }
+wifi_ifaces() { [ -n "$WIFI_IFACES" ] && echo "$WIFI_IFACES" || iwinfo 2>/dev/null | awk '/ESSID/{print $1}'; }
+in_list() { w=$1; shift; for x in "$@"; do [ "$x" = "$w" ] && return 0; done; return 1; }
+seconds_ok() { case "$1" in [5-9]|[12][0-9]|30) return 0 ;; esac; return 1; }
+
+# One capture and one VPN change at a time, each held by a lock for the whole run.
+caplock() { exec 9>/tmp/netmon-cap.lock; flock -n 9 || refuse busy 4; }
+vpnlock() { exec 7>/tmp/netmon-vpn.lock; flock -n 7 || refuse vpn-busy 4; }
+# ratelimit FILE SECONDS: refuse when the last run recorded in FILE is newer than SECONDS.
+ratelimit() { now=$(date +%s); last=$(cat "$1" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt "$2" ] && refuse rate-limited 4; echo "$now" > "$1"; }
+
+# Watches a streaming process (PID $1, the last command of the stream's pipeline) and stops it once the
+# router passes a limit. Any earlier command in the pipeline ends on its next write after that.
+guard() {
+  while kill -0 "$1" 2>/dev/null; do sleep 10; healthy || { kill "$1" 2>/dev/null; busy stopped; }; done
+}
+
+# ---------------------------------------------------------------- VPN backends
+vpn_intent() {   # prints 1 when the VPN switch is on
+  case "$VPN_BACKEND" in
+    glinet) [ "$(uci -q get route_policy.global.enabled)" = 1 ] && [ "$(uci -q get route_policy.@rule[0].enabled)" = 1 ] && echo 1 || echo 0 ;;
+    uci) [ "$(uci -q get network."$VPN_IFACE".disabled)" = 1 ] && echo 0 || echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+vpn_set() {      # vpn_set 1|0
+  case "$VPN_BACKEND" in
+    glinet) uci set route_policy.global.enabled="$1"; uci set route_policy.@rule[0].enabled="$1"; uci commit route_policy
+            /etc/init.d/vpn-client restart >/dev/null 2>&1 ;;
+    uci) uci set network."$VPN_IFACE".disabled=$((1 - $1)); uci commit network
+         if [ "$1" = 1 ]; then ifup "$VPN_IFACE"; else ifdown "$VPN_IFACE"; fi ;;
+  esac
+}
+vpn_handshake() { wg show "$VPN_IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1; }
+dns_status() { [ -x "$VPNDNS" ] && "$VPNDNS" status 2>/dev/null || echo null; }
+dns_sync() { [ -x "$VPNDNS" ] || return 0; "$VPNDNS" sync >/dev/null 2>&1 || { sleep 3; "$VPNDNS" sync >/dev/null 2>&1; }; }
+
+# ---------------------------------------------------------------- dnsmasq query log
+# Reads dnsmasq log lines on stdin and prints one JSON object per lookup:
+#   {"ts":<unix s>,"client":"<ip>","domain":"<name>","qtype":"A","status":"forwarded","answers":["192.0.2.7"]}
+# A lookup starts at its "query[...]" line. Later lines about the same lookup (matched by dnsmasq's serial number
+# with log-queries=extra, else by name) give its status:
+#   forwarded  sent upstream ("forwarded" line)            cached  answered from the cache ("cached" lines)
+#   blocked    answered 0.0.0.0, :: or NXDOMAIN from configuration or a hosts file
+#   other      local and DHCP names, or no outcome seen within 2000 lookups
+# "answers" lists the addresses in the "reply" or "cached" lines; the key is left out when there are none.
+# A forwarded or cached lookup is printed once a line about another lookup arrives after its answers, or 3 s after
+# the query. ts is the time the gate reads the query line; it follows the log live, so this is within a second.
+# dnsmasq logs to the second only, so the gate reports no reply time.
+dnslog_awk='
+function now() { srand(); return srand() }
+function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+function isaddr(a) { return a ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (a ~ /^[0-9a-fA-F:]+$/ && a ~ /:/ && a != "::") }
+function emit(k, st,   a) {
+  a = ans[k] != "" ? ",\"answers\":[" ans[k] "]" : ""
+  printf "{\"ts\":%d,\"client\":\"%s\",\"domain\":\"%s\",\"qtype\":\"%s\",\"status\":\"%s\"%s}\n", qts[k], esc(qc[k]), esc(qd[k]), qt[k], st, a
+  fflush(); delete qts[k]; delete qc[k]; delete qd[k]; delete qt[k]; delete stt[k]; delete ans[k]; n--
+}
+function flush(cur, t,   j) { for (j in stt) if (j != cur && (ans[j] != "" || t - qts[j] >= 3)) emit(j, stt[j]) }
+{
+  t = now()
+  i = 1; while (i <= NF && $i !~ /^dnsmasq(\[[0-9]+\])?:$/) i++
+  if (i > NF) next
+  i++; ser = ""
+  if ($i ~ /^[0-9]+$/ && $(i + 1) ~ /\//) { ser = $i; i += 2 }       # log-queries=extra: serial and client/port
+  act = $i; name = $(i + 1); val = $(i + 3)
+  if (act ~ /^query\[/) {
+    flush("", t)
+    q = act; sub(/^query\[/, "", q); sub(/\]$/, "", q); if (q ~ /^type=/) { sub(/^type=/, "TYPE", q) }
+    k = ser != "" ? ser : name
+    if (k in qd) emit(k, (k in stt) ? stt[k] : "other")
+    if (n >= 2000) { m = 0; for (j in qd) ks[++m] = j; for (x = 1; x <= m; x++) if (ks[x] in qd) emit(ks[x], (ks[x] in stt) ? stt[ks[x]] : "other") }
+    qts[k] = t; qd[k] = name; qt[k] = q; qc[k] = val; ans[k] = ""; n++
+    next
+  }
+  k = ser != "" ? ser : name
+  if (!(k in qd)) { flush("", t); next }
+  flush(k, t)
+  if (act == "forwarded") { stt[k] = "forwarded"; next }
+  if (act == "reply" || act == "cached" || act == "cached-stale") {
+    if (act != "reply") stt[k] = "cached"
+    if ((k in stt) && $(i + 2) == "is" && isaddr(val)) ans[k] = ans[k] (ans[k] != "" ? "," : "") "\"" val "\""
+    next
+  }
+  if (act == "validation") next
+  if ($(i + 2) == "is" && (val == "0.0.0.0" || val == "::" || val == "NXDOMAIN")) emit(k, "blocked")
+  else if ($(i + 2) == "is") emit(k, "other")
+}
+END { for (j in qd) emit(j, (j in stt) ? stt[j] : "other") }'
+
+# ---------------------------------------------------------------- subcommands
+case "$REQ" in
+  feed)
+    healthy || busy refused
+    command -v nc >/dev/null || refuse no-nc 6
+    exec 3<&0
+    nc "$FEED_HOST" "$FEED_PORT" <&3 & guard $! ;;
+
+  vitals)
+    metrics
+    C=$(awk '/^cpu /{print $2","$3","$4","$5","$6","$7","$8}' /proc/stat)
+    W=0; for i in $(wifi_ifaces); do n=$(iwinfo "$i" assoclist 2>/dev/null | grep -c dBm); W=$((W + n)); done
+    NP=$(cat "$NETIFYD_PID" 2>/dev/null); NR=0; [ -n "$NP" ] && NR=$(awk '/VmRSS/{print $2}' /proc/$NP/status 2>/dev/null)
+    UP=$(uci -q get dhcp.@dnsmasq[0].server | awk '{print $1}')
+    [ -n "$UP" ] || UP=$(awk '/^nameserver/{print $2; exit}' /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null)
+    case "$UP" in *[!0-9A-Za-z.:#/_-]*) UP="" ;; esac
+    IF=$(counters "$WAN_IFACE"); for b in $LAN_BRIDGES; do IF="$IF,$(counters "$b")"; done
+    printf '{"ts":%s,"uptime":%s,"load":[%s],"cpu":[%s],"temp_mc":%s,"mem_total_kb":%s,"mem_avail_kb":%s,' \
+      "$(date +%s)" "$(cut -d. -f1 /proc/uptime)" "$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')" "$C" "$T" \
+      "$(awk '/MemTotal/{print $2}' /proc/meminfo)" "$M"
+    printf '"conntrack":[%s,%s],"wifi_clients":%s,"netifyd_rss_kb":%s,"dns_upstream":"%s","ifaces":{%s}}\n' \
+      "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)" \
+      "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)" "$W" "${NR:-0}" "$UP" "$IF" ;;
+
+  conns)
+    healthy || busy refused
+    ratelimit /tmp/netmon-conns.ts 5
+    conntrack -L -o extended 2>/dev/null | head -4000 ;;
+
+  leases) cat /tmp/dhcp.leases 2>/dev/null ;;
+
+  protos) netifyd --dump-protos 2>/dev/null | head -2000 ;;
+
+  apps) healthy || busy refused; [ -r "$NETIFYD_APPS" ] || refuse no-apps 6; cat "$NETIFYD_APPS" ;;
+
+  links)
+    healthy || busy refused
+    # wifi|mac|band|signal|tx rate
+    for r in $(wifi_ifaces); do
+      b=$(iwinfo "$r" info 2>/dev/null | grep -oE '[0-9.]+ GHz' | head -1)
+      iwinfo "$r" assoclist 2>/dev/null | awk -v b="$b" '/dBm/{m=tolower($1);s=$2} /TX:/{print "wifi|"m"|"b"|"s"|"$2}'
+    done
+    # arp|mac|ip|bridge
+    awk '$1 ~ /\./ && $4 != "00:00:00:00:00:00" && $6 ~ /^br-/ {print "arp|"tolower($4)"|"$1"|"$6}' /proc/net/arp
+    # port|name|bridge port no|carrier|speed now|best own speed|best partner speed|rx_err|tx_err|rx_drop|tx_drop|rx_bytes|tx_bytes
+    for p in $WIRED_PORTS $WAN_IFACE; do
+      [ -d /sys/class/net/$p ] || continue
+      st=/sys/class/net/$p/statistics; E=$(ethtool "$p" 2>/dev/null)
+      m=$(echo "$E" | awk '/Supported link modes/{f=1} /Supported pause/{f=0} f' | grep -oE '[0-9]+base' | tr -d base | sort -n | tail -1)
+      pm=$(echo "$E" | awk '/Link partner advertised link modes/{f=1} /Link partner advertised pause/{f=0} f' | grep -oE '[0-9]+base' | tr -d base | sort -n | tail -1)
+      echo "port|$p|$(cat /sys/class/net/$p/brport/port_no 2>/dev/null)|$(cat /sys/class/net/$p/carrier 2>/dev/null)|$(cat /sys/class/net/$p/speed 2>/dev/null)|$m|$pm|$(cat $st/rx_errors)|$(cat $st/tx_errors)|$(cat $st/rx_dropped)|$(cat $st/tx_dropped)|$(cat $st/rx_bytes)|$(cat $st/tx_bytes)"
+    done
+    # fdb|bridge|mac|bridge port no (decimal)
+    for b in $LAN_BRIDGES; do
+      if command -v brctl >/dev/null; then
+        brctl showmacs "$b" 2>/dev/null | awk -v b="$b" '$3=="no"{print "fdb|"b"|"tolower($2)"|"$1}'
+      else
+        bridge fdb show br "$b" 2>/dev/null | awk '/ master / && !/permanent/ {print tolower($1), $3}' | while read -r mac dev; do
+          n=$(cat /sys/class/net/$dev/brport/port_no 2>/dev/null) && echo "fdb|$b|$mac|$(printf %d "$n")"
+        done
+      fi
+    done ;;
+
+  capture\ *)
+    healthy || busy refused
+    set -- $REQ
+    [ $# -eq 3 ] && in_list "$2" $CAPTURE_IFACES || refuse bad-interface
+    seconds_ok "$3" || refuse bad-seconds
+    command -v tcpdump >/dev/null || refuse no-tcpdump 6
+    caplock; ratelimit /tmp/netmon-cap.ts 55
+    exec timeout "$3" tcpdump -i "$2" -s 256 -c 40000 -U -w - not port "$SSH_PORT" 2>/dev/null ;;
+
+  ispview\ *)
+    # Handshake packets only: QUIC long headers, TLS handshakes, HTTP requests, connection openings, plain DNS
+    # and WireGuard handshakes. Whole packets, so the server names in them can be read.
+    healthy || busy refused
+    set -- $REQ
+    [ $# -eq 2 ] && seconds_ok "$2" || refuse bad-seconds
+    command -v tcpdump >/dev/null || refuse no-tcpdump 6
+    caplock; ratelimit /tmp/netmon-cap.ts 55
+    exec timeout "$2" tcpdump -i "$WAN_IFACE" -s 1600 -c 20000 -U -w - "(udp and udp[8] & 0x80 != 0) or (tcp and tcp[((tcp[12]&0xf0)>>2)] = 0x16) or (tcp dst port 80 and (tcp[tcpflags] & tcp-push != 0)) or (tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn) or port 53 or (udp and udp[8] < 5 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0)" 2>/dev/null ;;
+
+  dnslog)
+    healthy || busy refused
+    [ -r "$DNS_LOG" ] || refuse no-dnslog 6
+    tail -n 0 -F "$DNS_LOG" 2>/dev/null | awk "$dnslog_awk" & guard $! ;;
+
+  cake)
+    [ -n "$SHAPER_DEVS" ] || refuse no-shapers 6
+    for i in $SHAPER_DEVS; do echo "## $i"; tc -s qdisc show dev "$i" 2>/dev/null | grep -A40 "qdisc cake"; done ;;
+
+  health)
+    # Line format: kind|field|field. Update counts come from the package lists already on the router.
+    echo "v|1|$(date +%s)"
+    h=$(uci -q get system.@system[0].hostname); echo "host|$h|$h"
+    . /etc/openwrt_release 2>/dev/null
+    gl=$(cat /etc/glversion 2>/dev/null)
+    echo "os|${DISTRIB_DESCRIPTION:-OpenWrt}${gl:+ · vendor firmware $gl}|$(uname -r)"
+    echo "model|$(cat /tmp/sysinfo/model 2>/dev/null)|$(grep -c ^processor /proc/cpuinfo) cores"
+    echo "uptime|$(cut -d. -f1 /proc/uptime)"
+    echo "load|$(awk '{print $1"|"$2"|"$3}' /proc/loadavg)"
+    echo "cpus|$(grep -c ^processor /proc/cpuinfo)"
+    awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} END {print "mem|"t"|"a"|"; print "swap|0|0"}' /proc/meminfo
+    df -kP /overlay /tmp 2>/dev/null | awk 'NR>1 {print "disk|"$6"|"($6=="/tmp"?"ram":"flash")"|"$2"|"$3"|"$4}'
+    for z in /sys/class/thermal/thermal_zone*; do [ -r $z/temp ] && echo "temp|$(cat $z/type)|$(awk '{printf "%.1f", $1/1000}' $z/temp)"; done
+    for i in $WAN_IFACE $LAN_BRIDGES $([ "$VPN_BACKEND" != none ] && echo "$VPN_IFACE"); do
+      [ -d /sys/class/net/$i ] && echo "net|$i|$(cat /sys/class/net/$i/statistics/rx_bytes)|$(cat /sys/class/net/$i/statistics/tx_bytes)"
+    done
+    for b in $LAN_BRIDGES; do
+      a=$(ip -4 -o addr show "$b" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+      [ -n "$a" ] && echo "addr|$b|$a|$(cat /sys/class/net/$b/address)"
+    done
+    n=$(opkg list-upgradable 2>/dev/null | wc -l); lm=$(ls -t /var/opkg-lists/* 2>/dev/null | head -1)
+    echo "updc|opkg|$n|$( [ -n "$lm" ] && date -r "$lm" +%s || echo 0)|$(opkg list-upgradable 2>/dev/null | cut -d' ' -f1 | head -12 | tr '\n' ' ')"
+    pa=$(uci -q get dropbear.@dropbear[0].PasswordAuth); echo "posture|ssh_password_auth|${pa:-on}"
+    [ "$VPN_BACKEND" = glinet ] && echo "posture|vpn_kill_switch|$(uci -q get route_policy.@rule[0].killswitch)"
+    true ;;
+
+  integrity)
+    # Line format: kind|field|field. The self-test compares these with the copy it blessed.
+    echo "v|1|$(date +%s)"
+    KEEP=$(sysupgrade -l 2>/dev/null)                  # every file a firmware upgrade preserves
+    for f in $INTEGRITY_FILES; do
+      h=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+      echo "$KEEP" | grep -qx "$f" && k=1 || k=0
+      echo "file|$f|${h:-missing}|$k"
+    done
+    for s in $(uci -q show sqm 2>/dev/null | sed -n 's/^sqm\.\([^.=]*\)=queue$/\1/p'); do
+      echo "sqm|$s|$(uci -q get sqm.$s.interface)|$(uci -q get sqm.$s.enabled)|$(uci -q get sqm.$s.download)|$(uci -q get sqm.$s.upload)|$(uci -q get sqm.$s.overhead)|$(uci -q get sqm.$s.script)"
+    done
+    for i in $SHAPER_DEVS; do
+      q=$(tc qdisc show dev "$i" 2>/dev/null)
+      echo "qdisc|$i|$(echo "$q" | grep -o 'cake.*bandwidth [0-9.]*[KMG]\?bit' | grep -o '[0-9.]*[KMG]\?bit$')|$(echo "$q" | grep -o 'diffserv[0-9]' | head -1)"
+    done
+    for i in $WAN_IFACE $([ "$VPN_BACKEND" != none ] && echo "$VPN_IFACE"); do
+      echo "ctinfo|$i|$(tc filter show dev "$i" ingress 2>/dev/null | grep -c 'ctinfo.*pipe')"
+    done
+    for c in netmon_prio:FORWARD netmon_dscpmark:POSTROUTING; do
+      n=${c%%:*}; h=${c##*:}
+      echo "mangle|$n|$(iptables -w -t mangle -S $n 2>/dev/null | grep -c '^-A')|$(iptables -w -t mangle -S $h 2>/dev/null | grep -c "\-j $n\$")"
+    done
+    echo "prio_pkts|$(iptables -w -t mangle -L netmon_prio -v -n -x 2>/dev/null | awk '/MAC/ {s+=$1} END {print s+0}')"
+    echo "l2block|$(nft list table bridge netmon_block 2>/dev/null | grep -c drop)"
+    echo "natdns|$(iptables -w -t nat -S netmon_vpn_dns 2>/dev/null | grep -c 'REDIRECT')"
+    echo "cron|watchdog|$(crontab -l 2>/dev/null | grep -c 'netmon-watchdog.sh')"
+    echo "vpndns|$(dns_status)" ;;
+
+  "vpn status")
+    e=$(vpn_intent); r=$e; p=""
+    [ "$VPN_BACKEND" = glinet ] && { e=$(uci -q get route_policy.global.enabled); r=$(uci -q get route_policy.@rule[0].enabled); p=$(uci -q get route_policy.@rule[0].peer_id); }
+    hs=$(vpn_handshake); tr=$(wg show "$VPN_IFACE" transfer 2>/dev/null | awk '{print $2","$3}' | head -1)
+    ep=$(wg show "$VPN_IFACE" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    case "$ep" in *[!0-9a-fA-F.:\[\]]*) ep="" ;; esac
+    case "$p" in *[!0-9A-Za-z_-]*) p="" ;; esac
+    printf '{"backend":"%s","enabled":"%s","rule":"%s","peer":"%s","handshake":%s,"transfer":[%s],"now":%s,"dns":%s,"endpoint":"%s"}\n' \
+      "$VPN_BACKEND" "$e" "$r" "$p" "${hs:-0}" "${tr:-0,0}" "$(date +%s)" "$(dns_status)" "$ep" ;;
+
+  "vpn on")
+    [ "$VPN_BACKEND" = none ] && refuse no-vpn 6
+    healthy || busy refused
+    if [ "$VPN_BACKEND" = glinet ] && [ -n "$VPN_PEER_ID" ]; then
+      [ "$(uci -q get route_policy.@rule[0].peer_id)" = "$VPN_PEER_ID" ] || refuse unexpected-peer
+    fi
+    vpnlock
+    logger -t netmon-vpn "switching the VPN on"
+    vpn_set 1
+    i=0; ok=0
+    while [ $i -lt "$VPN_UP_WAIT" ]; do
+      sleep 2; i=$((i + 2))
+      hs=$(vpn_handshake)
+      [ -n "$hs" ] && [ "$hs" -gt 0 ] && [ $(( $(date +%s) - hs )) -lt 60 ] && { ok=1; break; }
+    done
+    if [ $ok = 1 ]; then
+      logger -t netmon-vpn "VPN on, handshake after ${i}s"; dns_sync
+      echo "{\"vpn\":\"on\",\"after\":$i,\"dns\":$(dns_status)}"
+    else
+      vpn_set 0; dns_sync
+      logger -t netmon-vpn "no handshake within ${VPN_UP_WAIT}s; VPN switched back off"
+      echo '{"vpn":"failed-reverted"}'; exit 5
+    fi ;;
+
+  "vpn off")
+    [ "$VPN_BACKEND" = none ] && refuse no-vpn 6
+    vpnlock
+    logger -t netmon-vpn "switching the VPN off"
+    vpn_set 0; dns_sync
+    echo "{\"vpn\":\"off\",\"dns\":$(dns_status)}" ;;
+
+  *) refuse not-allowed ;;
+esac

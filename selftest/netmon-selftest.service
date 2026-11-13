@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# netmon self-test, one run. Started every 15 minutes by netmon-selftest.timer and at once by
+# netmon-selftest.path when the Self-test page's Run now button drops a file in the queue folder.
+# Replace /opt/netmon with the repository path. Set "selftest": {"queue_dir": "/var/lib/netmon/selftest/queue"}
+# in config.json so the collector and this unit use the same folder. Install: see docs/INSTALL.md.
+[Unit]
+Description=netmon self-test
+After=netmon.service
+
+[Service]
+Type=oneshot
+User=netmon
+WorkingDirectory=/opt/netmon
+Environment=NETMON_CONFIG=/opt/netmon/config.json
+Environment=HOME=/var/lib/netmon
+ExecStart=/usr/bin/python3 /opt/netmon/selftest/selftest.py run
+Nice=5

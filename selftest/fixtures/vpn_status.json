@@ -1,0 +1,1 @@
+{"backend":"uci","enabled":"1","rule":"1","peer":"","handshake":1794579990,"transfer":[123456789,9876543],"now":1794580000,"dns":{"want":"tunnel","have":"tunnel","vpn_resolver":true,"ok":true},"endpoint":"203.0.113.50:51820"}

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Lines for the router's root crontab: append them to /etc/crontabs/root, then run /etc/init.d/cron restart.
+#
+# The link watchdog. It does nothing unless WATCHDOG_PORTS is set in /etc/netmon/gate.conf.
+* * * * * /usr/bin/netmon-watchdog.sh >/dev/null 2>&1
+#
+# Keeps dnsmasq's query log in RAM small: once it passes 4 MB it is deleted and dnsmasq (on SIGUSR2) opens a new
+# one. "dnslog" follows the new file. Use the same path as DNS_LOG in gate.conf.
+*/5 * * * * f=/tmp/dnsmasq.log; [ -f $f ] && [ $(wc -c < $f) -gt 4000000 ] && rm -f $f && killall -USR2 dnsmasq

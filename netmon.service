@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# systemd unit for netmon. Install: copy the repository to /opt/netmon, create the user and folder
+#   useradd --system --home /var/lib/netmon --shell /usr/sbin/nologin netmon
+#   install -d -o netmon -g netmon /var/lib/netmon
+# then: cp netmon.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now netmon
+# The ssh key for the router lives in the netmon user's ~/.ssh (here /var/lib/netmon/.ssh).
+[Unit]
+Description=netmon network monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netmon
+Group=netmon
+WorkingDirectory=/opt/netmon
+ExecStart=/usr/bin/python3 /opt/netmon/netmon.py --config /opt/netmon/config.json
+Environment=HOME=/var/lib/netmon
+# Uncomment to send alert mail with a password kept out of config.json:
+# EnvironmentFile=/etc/netmon/smtp.env
+Restart=on-failure
+RestartSec=30
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/netmon /tmp
+PrivateTmp=false
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

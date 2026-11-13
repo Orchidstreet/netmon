@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Starts netmon-selftest.service when a file appears in the self-test queue folder (the Run now button).
+[Unit]
+Description=netmon self-test queue
+
+[Path]
+DirectoryNotEmpty=/var/lib/netmon/selftest/queue
+Unit=netmon-selftest.service
+
+[Install]
+WantedBy=paths.target

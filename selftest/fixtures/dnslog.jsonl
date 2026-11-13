@@ -1,0 +1,5 @@
+{"ts":1794580001,"client":"192.168.1.23","domain":"example.com","qtype":"A","status":"forwarded","answers":["198.51.100.7"]}
+{"ts":1794580001,"client":"192.168.1.23","domain":"example.com","qtype":"AAAA","status":"cached"}
+{"ts":1794580002,"client":"192.168.1.40","domain":"ads.example.net","qtype":"A","status":"blocked"}
+{"ts":1794580003,"client":"192.168.1.41","domain":"printer.lan","qtype":"A","status":"other"}
+{"ts":1794580004,"client":"192.168.1.23","domain":"svc.example.org","qtype":"TYPE65","status":"forwarded"}

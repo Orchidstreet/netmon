@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- netmon self-test for macOS: runs selftest.py every 15 minutes, and at once when a file appears in the
+     queue folder (the Self-test page's Run now button). Read-only.
+     Replace /opt/netmon with the repository path and /var/lib/netmon with collector.data_dir from config.json,
+     then: cp com.netmon.selftest.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.netmon.selftest.plist
+     A LaunchAgent (not a LaunchDaemon) is needed for the browser check, which opens an off-screen window. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.netmon.selftest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/opt/netmon/selftest/selftest.py</string>
+    <string>run</string>
+  </array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>QueueDirectories</key><array><string>/var/lib/netmon/selftest/queue</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>WorkingDirectory</key><string>/opt/netmon</string>
+  <key>StandardOutPath</key><string>/var/lib/netmon/logs/selftest.log</string>
+  <key>StandardErrorPath</key><string>/var/lib/netmon/logs/selftest.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>NETMON_CONFIG</key><string>/opt/netmon/config.json</string>
+  </dict>
+</dict>
+</plist>

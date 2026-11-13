@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+v|1|1794580000
+host|edge-01|edge-01
+os|OpenWrt 23.05.5 r24106-10cc5fcd00|5.15.167
+model|Example Networks EX-6000|4 cores
+uptime|60003
+load|0.08|0.04|0.07
+cpus|4
+mem|1013116|571976|
+swap|0|0
+disk|/overlay|flash|7008876|522284|6486592
+disk|/tmp|ram|506556|19380|487176
+temp|cpu-thermal|52.9
+net|eth1|10951332374|2893474896
+addr|br-lan|192.168.1.1|02:00:5e:00:00:01
+updc|opkg|2|1794560000|iperf3 dnsmasq-full 
+posture|ssh_password_auth|off

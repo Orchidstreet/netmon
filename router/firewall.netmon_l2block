@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Firewall include: drops every frame from or to the MAC addresses in L2BLOCK_MACS at the bridge, before any
+# routing, so a quarantined device cannot reach anything on the LAN either. On MediaTek Wi-Fi drivers the
+# interfaces in L2BLOCK_WIFI_ACL_IFACES also get a deny ACL entry for each address. Idempotent.
+# Settings come from /etc/netmon/gate.conf. Needs nftables (kmod-nft-bridge).
+CONF=${NETMON_GATE_CONF:-/etc/netmon/gate.conf}
+[ -r "$CONF" ] && . "$CONF"
+nft delete table bridge netmon_block 2>/dev/null
+[ -n "$L2BLOCK_MACS" ] || exit 0
+nft add table bridge netmon_block
+nft add chain bridge netmon_block pre '{ type filter hook prerouting priority -200; policy accept; }'
+for m in $L2BLOCK_MACS; do
+  nft add rule bridge netmon_block pre ether saddr "$m" counter drop
+  nft add rule bridge netmon_block pre ether daddr "$m" counter drop
+done
+for i in $L2BLOCK_WIFI_ACL_IFACES; do
+  iwpriv "$i" set AccessPolicy=2 >/dev/null 2>&1
+  for m in $L2BLOCK_MACS; do iwpriv "$i" set ACLAddEntry="$m" >/dev/null 2>&1; done
+done

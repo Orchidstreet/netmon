@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Lines to append to /etc/sysupgrade.conf, so a firmware upgrade keeps netmon's router files:
+#   grep -v '^#' sysupgrade.list >> /etc/sysupgrade.conf
+/usr/bin/netmon-gate
+/usr/bin/netmon-vpn-dns.sh
+/usr/bin/netmon-watchdog.sh
+/etc/netmon/
+/etc/dropbear/authorized_keys
